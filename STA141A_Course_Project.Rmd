@@ -1,0 +1,1181 @@
+---
+title: "STA141A Course Project"
+author: "Anii Chen"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+---
+
+```{r include=FALSE, echo=TRUE, eval=TRUE, message=FALSE}
+
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(knitr))
+suppressWarnings(library(kableExtra))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(ROCR))
+suppressWarnings(library(class))
+suppressWarnings(library(caret))
+suppressWarnings(library(e1071))
+suppressWarnings(library(gbm))
+
+```
+
+## Abstarct
+
+In this project, we will use the subset of data collected by Steinmetz et al.(2019) to conduct the analysis. The main purpose of this project is to build a predictive model to determine the outcome (feedback type) of trials based on neural activity data (spks) and stimulus conditions (left and right contrasts).
+
+There are three main parts in our predictive modeling process followed by:
+
+1.  Exploratory data analysis, where we describe the data structures and compare across sessions and trials.
+
+2.  Data integration, where we combine data across trials. There are mainly two data frames created in the project, involving benchmark methods, missing values imputation, and scaling.
+
+3.  Model training/prediction, where we build prediction models using various techniques such as naive, logistic regression, k nearest neighbor, SVM, and GBM to predict the feedback type.
+
+Then the performance of the selected model will be evaluated with two test sets. Finally, the reports will end with conclusions and discussion.
+
+## Introduction
+
+In the original study by Steinmetz et al. (2019), visual stimuli were presented to 10 mice over 39 sessions. In the experiments, the mice made decisions with a wheel controlled by their forepaws based on the stimuli. During each trial, the response and neural activity data from the visual cortex (spks) were recorded.
+
+The data we use in this project is the subset of data that focus on 18 sessions from four specific mice: Cori, Frossman, Hence, and Lederberg. Each trial in the dataset includes variables such as feedback type, left and right stimulus contrasts, timestamps for spike counts, and brain areas where neurons reside. Left and right contrasts took values in {0, 0.25, 0.5, 1}, when the stimulus is absent, recorded as 0.
+
+The primary objective of this project is to build a predictive model to forecast feedback types based on neural activity and stimulus data.
+
+In this project, we will first understand the data structure and neural activities through exploratory data analysis. Then we combine information across sessions by data integration. Finally, we build the predictive models, compare performances, and evaluate with the test sets.
+
+The performance of the model will be assessed using two test sets randomly selected from Sessions 1 and 18.
+
+## Exploratory analysis
+
+#### Understanding Data
+
+A total of 18 RDS files are provided that contain the records from 18 sessions. In each RDS file, you can find the name of mouse from `mouse_name` and date of the experiment from `date_exp`.
+
+```{r echo=FALSE, message=FALSE}
+# Load the data 
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+  }
+```
+
+```{r echo=FALSE, message=FALSE}
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+   print(session[[i]]$mouse_name)
+   print(session[[i]]$date_exp)
+  
+}
+```
+
+In this project, there are four mice, and the date of the experiment may not be directly correlated with the outcome that we want to predict.
+
+#### Session & Trial
+
+Each session contains a different number of trail data. For each trail, there are six variables available, including:
+
+-   `feedback_type`: type of the feedback, 1 for success and -1 for failure, , notice that potential issues may exist since the data is recorded as 
+    -   When left contrast \> right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.
+
+    -   When right contrast \> left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.
+
+    -   When left contrasts = right contrasts = zero, success (1) if holding the wheel still and failure (-1) otherwise.
+
+    -   When left contrasts = right contrasts and not zero, left or right will be randomly chosen (50%) as the correct choice.
+-   `contrast_left` and `contrast_right`: contrast of the left / right stimulus, which take values {0,0.25,0.5,0.75,1}
+-   `time`: centers of the time bins for `spks`, recorded as vector of dimension q across sessions for number of trials Ni
+-   `spks`: numbers of spikes of neurons in the visual cortex in time bins defined in `time`, recorded as matrix of dimensions pi×qi across session i for number of trials Ni, with each entry being the number of spikes of one neuron (i.e., row) in each time bin (i.e., column)
+-   `brain_area`: area of the brain where each neuron lives
+
+```{r include=FALSE, echo=FALSE, message=FALSE}
+session[[1]]$contrast_left
+```
+
+We can summarize the information for each session with the table below.
+
+```{r echo=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+n.session=length(session)
+
+meta <- tibble(
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+
+for(i in 1:n.session){
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+names(meta) <- c("Mouse Name", "Date", "Number of Brain Areas", "Number of Neurons", "Number of Trials", "Success Rate")
+kable(meta, format = "html", table.attr = "class='table table-striped'",digits=2)
+```
+
+We calculate the success rate for each session by counting the number of successes (1 in feedback_type) and dividing by the total number of trials in that session. 
+
+We can also know which specific brain areas were recorded in each session from the plot below.
+
+```{r echo=FALSE, message=FALSE}
+
+unique_brain_areas <- lapply(session, function(sess) unique(sess$brain_area))
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  session_id = rep(seq_along(unique_brain_areas), lengths(unique_brain_areas)),
+  brain_area = unlist(unique_brain_areas)
+)
+
+# Plot using ggplot2
+library(ggplot2)
+
+ggplot(plot_data, aes(x = factor(session_id), y = brain_area)) +
+  geom_point() +
+  labs(x = "Session ID", y = "Brain Area") +
+  scale_x_discrete(labels = paste(seq_along(unique_brain_areas))) +
+  theme_minimal()
+```
+
+```{r include=FALSE}
+dim(session[[1]]$spks[[1]])
+length(session[[1]]$brain_area)
+session[[1]]$spks[[1]][6,]
+```
+
+#### Data Processing
+
+Noting that the heterogeneity is due to the differences in neurons measured in each session, and to make the dataset more manageable, we condense the information at the level of brain areas instead of considering each neuron individually. We can ignore the information about specific neurons by averaging over their activities. Therefore, we first calculate the number of spikes for each neuron during each trial, then we take the average of spikes across neurons that live in the same area. By averaging the spike counts across neurons within the same area, we can reduce the dimensionality of the data.
+
+We can take a look at the average od spikes for each area recorded for session 2 trail 1:
+
+```{r echo=FALSE, message=FALSE}
+
+i.s=2 # indicator for this session
+
+i.t=1 # indicator for this trial 
+
+spk.trial = session[[i.s]]$spks[[i.t]]
+area=session[[i.s]]$brain_area
+
+# We need to first calculate the number of spikes for each neuron during this trial 
+spk.count=apply(spk.trial,1,sum)
+
+# for(i in 1:dim(spk.trial)[1]){
+#  spk.count[i]=sum(spk.trial[i,])
+# }
+
+# Next we take the average of spikes across neurons that live in the same area 
+
+# You can use tapply() or group_by() in dplyr
+
+# tapply():
+spk.average.tapply=tapply(spk.count, area, mean)
+
+
+# dplyr: 
+# To use dplyr you need to create a data frame
+tmp <- data.frame(
+  area = area,
+  spikes = spk.count
+)
+# Calculate the average by group using dplyr
+spk.average.dplyr =tmp %>%
+  group_by(area) %>%
+  summarize(mean= mean(spikes))
+
+# Wrapping up the function:
+
+average_spike_area<-function(i.t,this_session){
+  spk.trial = this_session$spks[[i.t]]
+  area= this_session$brain_area
+  spk.count=apply(spk.trial,1,sum)
+  spk.average.tapply=tapply(spk.count, area, mean)
+  return(spk.average.tapply)
+  }
+
+# Test the function
+average_spike_area(1,this_session = session[[i.s]])
+
+```
+
+And also look at all the trials in session 2:
+
+```{r echo=FALSE, message=FALSE}
+
+n.trial=length(session[[i.s]]$feedback_type)
+n.area=length(unique(session[[i.s]]$brain_area ))
+# Alternatively, you can extract these information in the meta that we created before.
+
+# We will create a data frame that contain the average spike counts for each area, feedback type,  the two contrasts, and the trial id
+
+trial.summary =matrix(nrow=n.trial,ncol= n.area+1+2+1)
+for(i.t in 1:n.trial){
+  trial.summary[i.t,]=c(average_spike_area(i.t,this_session = session[[i.s]]),
+                          session[[i.s]]$feedback_type[i.t],
+                        session[[i.s]]$contrast_left[i.t],
+                        session[[i.s]]$contrast_right[i.s],
+                        i.t)
+}
+
+colnames(trial.summary)=c(names(average_spike_area(i.t,this_session = session[[i.s]])), 'feedback', 'left contr.','right contr.','id' )
+
+# Turning it into a data frame
+trial.summary <- as_tibble(trial.summary)
+kable(head(trial.summary))
+```
+
+#### Visualize how spikes change across trials for each session along with feedback type
+
+After we calculate the average spikes for each brain area, we want to know if there are any patterns that can be found with the feedback type, since the purpose for this project is to predict the feedback type. Therefore, we plot the average spikes against each trail for 18 sessions. We also include the feedback information with different point shapes.
+
+```{r include=FALSE,message=FALSE}
+
+n_colors <- 15
+area.col <- rainbow(n_colors, alpha = 0.7)
+
+# In base R, I usually initiate a blank plot before drawing anything on it
+plot(x=1,y=0, col='white',xlim=c(0,n.trial),ylim=c(0.5,2.2), xlab="Trials",ylab="Average spike counts", main=paste("Spikes per area in Session", i.s))
+
+
+
+for(i in 1:n.area){
+  lines(y=trial.summary[[i]],x=trial.summary$id,col=area.col[i],lty=2,lwd=1)
+  lines(smooth.spline(trial.summary$id, trial.summary[[i]]),col=area.col[i],lwd=3)
+  lines(y=trial.summary[[i]],x=trial.summary$id,col=area.col[i],lty=2,lwd=1)
+ 
+  }
+legend("topright", 
+  legend = colnames(trial.summary)[1:n.area], 
+  col = area.col, 
+  lty = 1, 
+  cex = 0.8
+)
+
+```
+
+```{r include=FALSE,echo=FALSE, message=FALSE}
+
+n_colors <- 15
+area.col <- rainbow(n_colors, alpha = 0.7)
+par(mfrow = c(1, 1))
+for (i.s in 1:18) {
+  # Calculate the number of trials and brain areas for the current session
+  n.trial <- length(session[[i.s]]$feedback_type)
+  n.area <- length(unique(session[[i.s]]$brain_area))
+  
+  # Calculate trial summary data
+  trial.summary <- matrix(nrow = n.trial, ncol = n.area + 1 + 2 + 1)
+  for (i.t in 1:n.trial) {
+    trial.summary[i.t, ] <- c(average_spike_area(i.t, this_session = session[[i.s]]),
+                              session[[i.s]]$feedback_type[i.t],
+                              session[[i.s]]$contrast_left[i.t],
+                              session[[i.s]]$contrast_right[i.t],
+                              i.t)
+  }
+  colnames(trial.summary) <- c(names(average_spike_area(i.t, this_session = session[[i.s]])), 
+                                'feedback', 'left contr.', 'right contr.', 'id')
+  
+  # Initialize a blank plot for each session
+  plot(x = 1, y = 0, col = 'white', xlim = c(0, n.trial), ylim = c(0, 3), 
+       xlab = "Trials", ylab = "Average spike counts", 
+       main = paste("Spikes per area in Session", i.s))
+  
+  # plot lines
+  for (i in 1:n.area) {
+    lines(y = trial.summary[, i], x = trial.summary[, 'id'], col = area.col[i], lty = 2, lwd = 1)
+    lines(smooth.spline(trial.summary[, 'id'], trial.summary[, i]), col = area.col[i], lwd = 3)
+    lines(y = trial.summary[, i], x = trial.summary[, 'id'], col = area.col[i], lty = 2, lwd = 1)
+  }
+
+  # Add legend
+  legend("topright", 
+         legend = colnames(trial.summary)[1:n.area], 
+         col = area.col, 
+         lty = 1, 
+         cex = 0.8)
+}
+```
+
+```{r echo=FALSE, message=FALSE}
+n_colors <- 15
+area.col <- rainbow(n_colors, alpha = 0.7)
+
+par(mfrow = c(1, 1))
+
+for (i.s in 1:18) {
+  # Calculate the number of trials and brain areas for the current session
+  n.trial <- length(session[[i.s]]$feedback_type)
+  n.area <- length(unique(session[[i.s]]$brain_area))
+  
+  # Calculate trial summary data
+  trial.summary <- matrix(nrow = n.trial, ncol = n.area + 1 + 2 + 1)
+  for (i.t in 1:n.trial) {
+    trial.summary[i.t, ] <- c(average_spike_area(i.t, this_session = session[[i.s]]),
+                              session[[i.s]]$feedback_type[i.t],
+                              session[[i.s]]$contrast_left[i.t],
+                              session[[i.s]]$contrast_right[i.t],
+                              i.t)
+  }
+  colnames(trial.summary) <- c(names(average_spike_area(i.t, this_session = session[[i.s]])), 
+                                'feedback', 'left contr.', 'right contr.', 'id')
+  
+  # Initialize a blank plot for each session
+  plot(x = 1, y = 0, col = 'white', xlim = c(0, n.trial), ylim = c(0, 3), 
+       xlab = "Trials", ylab = "Average spike counts", 
+       main = paste("Spikes per area in Session", i.s))
+  
+  # plot data points
+  for (i in 1:n.area) {
+    for (feedback in c(-1, 1)) {
+      
+      subset_data <- subset(trial.summary, trial.summary[, 'feedback'] == feedback)
+      
+      
+      points(x = subset_data[, 'id'], y = subset_data[, i], 
+             col = area.col[i], pch = ifelse(feedback == -1, 1, 16))  
+    }
+  }
+    # Add legend 
+  legend("bottomleft", 
+         legend = colnames(trial.summary)[1:n.area], 
+         col = area.col,
+         pch = 16, 
+         cex = 0.8,
+         title = "Brain Area")
+  # Add legend
+  legend("topright", 
+         legend = c("-1 (Negative Feedback)", "1 (Positive Feedback)"),
+         col = c(1, 16),  # Corresponding colors for -1 and 1
+         pch = c(1, 16),  # Corresponding point shapes for -1 and 1
+         cex = 0.8)
+}
+```
+
+From the plots above, we did not found any brain areas that are significant to the feedback type, therefore we decided to consider two variations for further process:
+
+1.  We take the average of the spikes for each trial, which we condense the specific brain area information.
+
+2.  We keep all the information of average spikes per area for further analysis.
+
+Then we combine the data for all trials in 18 sessions to dataframes.
+
+## Data integration
+
+In this project, two data frames were created for further model predictive modeling process.
+
+#### Data frame 1
+
+We first create a data frame (data frame 1) that includes session ID, mouse name, trial ID, left contrast, right contrast, average spks, and feedback type for all trials from 18 sessions. Average spks is the average spike counts during that trial, which were integrated by summing spikes for each neuron, resulting in a vector that contains the total number of spikes for all neurons during the 0.4 seconds in that trial; then, take the average of the total number of spikes. By using the average spks, we ignore the information about specific neurons.
+
+```{r echo=FALSE, message=FALSE}
+average_spikes_trial <- function(session, trial) {
+  spks_trial <- session$spks[[trial]]
+  total_spikes <- apply(spks_trial, 1, sum)
+  return(mean(total_spikes))
+}
+
+# Apply the function to all trials across all sessions
+all_avg_spikes <- sapply(session, function(sess) {
+  sapply(seq_along(sess$spks), function(trial) {
+    average_spikes_trial(sess, trial)
+  })
+})
+```
+
+```{r echo=FALSE, message=FALSE}
+full_data_frame <- tibble()
+
+
+for (session_id in 1:length(session)) {
+  
+  for (trial_id in 1:length(session[[session_id]]$contrast_left)) {
+    
+    row_data <- tibble(
+      session_id = session_id,
+      mouse_name = session[[session_id]]$mouse_name,  # actual mouse name
+      trial_id = trial_id,
+      left_contrast = session[[session_id]]$contrast_left[trial_id],
+      right_contrast = session[[session_id]]$contrast_right[trial_id],
+      avg_spikes = all_avg_spikes[[session_id]][trial_id],  # actual average spikes per trial
+      feedback_type = session[[session_id]]$feedback_type[trial_id]  # actual feedback type
+    )
+    
+    
+    full_data_frame <- bind_rows(full_data_frame, row_data)
+  }
+}
+
+
+library(kableExtra)
+
+# Print the head of the full data frame using kable
+kable(head(full_data_frame), format = "html") %>%
+  kable_styling()
+
+```
+
+#### Dataframe 2
+
+The second data frame (data frame 2) includes average spikes per brain area, feedback type, left right contrast, trail id, and session id for all trials from 18 sessions. Since the brain areas recorded are different within each session, there will be missing values. 
+
+```{r echo=FALSE, message=FALSE}
+
+n.sessions <- length(session)
+
+trial_summary_list <- vector("list", n.sessions)
+
+for (i.s in 1:n.sessions) {
+
+  n.trial <- length(session[[i.s]]$feedback_type)
+  n.area <- length(unique(session[[i.s]]$brain_area))
+  
+  trial_summary <- matrix(nrow = n.trial, ncol = n.area + 1 + 2 + 2)  
+  
+  for (i.t in 1:n.trial) {
+   
+    trial_summary[i.t,] <- c(average_spike_area(i.t, this_session = session[[i.s]]),
+                              session[[i.s]]$feedback_type[i.t],
+                              session[[i.s]]$contrast_left[i.t],
+                              session[[i.s]]$contrast_right[i.t],
+                              i.t,
+                              i.s)  # Add session ID
+  }
+  
+  colnames(trial_summary) <- c(names(average_spike_area(i.t, this_session = session[[i.s]])), 
+                                'feedback', 'left contr.', 'right contr.', 'trial_id', 'session_id') 
+  
+  trial_summary_list[[i.s]] <- as_tibble(trial_summary)
+}
+
+```
+
+```{r echo=FALSE, message=FALSE}
+library(dplyr)
+
+combined_df <- bind_rows(trial_summary_list)
+
+kable(head(combined_df), format = "html") %>%
+  kable_styling()
+```
+
+To deal with the missing values, we impute the mean of the corresponding feature, which is by calculating non-missing values of corresponding brain area.  
+
+```{r echo=FALSE, message=FALSE}
+# Impute missing values with the mean of the corresponding feature
+impute_mean <- function(x) {
+  mean_value <- mean(x, na.rm = TRUE)
+  x[is.na(x)] <- mean_value
+  return(x)
+}
+
+# Apply the imputation function to the features
+imputed_features <- apply(combined_df, 2, impute_mean)
+kable(head(imputed_features), format = "html") %>%
+  kable_styling()
+```
+
+After replacing the missing value with the mean value calculated for that feature, we have also tried to scale the data, except for session id and trial id. By doing this, we want to try to ensure that each feature has mean = 0 and standard deviation = 1, which is common for many machine learning algorithms to prevent features with larger scales dominate the learning process.
+
+```{r echo=FALSE, message=FALSE}
+
+# Scale features except trial_id and session_id
+scaled_imputed_features <- scale(imputed_features[, !colnames(imputed_features) %in% c("trial_id", "session_id")])
+
+scaled_imputed_features <- cbind(scaled_imputed_features, combined_df[, c("trial_id", "session_id")])
+
+kable(head(scaled_imputed_features), format = "html") %>%
+  kable_styling()
+```
+
+However, if we want to test the model after predictive modeling, we need to have the same data dimension between test and train data. Noticed that we will be testing our model using two dataset from session 1 and session 18, when we scale the test data after imputing the mean for missing features, there will exist missing values due to zero variance, therefore, we decided not to use the scaled data to train the model in this project. Instead, we will be using the data frame 2 with only replacing the missing value with the mean value.
+
+# Predictive modeling
+
+We select 80% of the first data frame randomly as the train data 1, and the rest will be the test data 1.
+
+```{r include=FALSE, echo=FALSE, message=FALSE}
+set.seed(141)
+
+num_trials <- nrow(full_data_frame)
+num_train <- 0.8 * num_trials 
+
+# Randomly sample indices for training data
+train_indices <- sample(1:num_trials, num_train, replace = FALSE)
+
+# Extract training and test data
+train_data <- full_data_frame[train_indices, ]
+test_data <- full_data_frame[-train_indices, ]
+train_data$factor_feedback <- as.factor(train_data$feedback_type)
+test_data$factor_feedback<- as.factor(test_data$feedback_type)
+train_data
+test_data
+```
+
+#### Naive Model (Model 0)
+
+We first build the naive model (model 0) as the base case, in which we assume all the predictive outcomes (feedback_type) are success (1). By the confusion matrix, we can see that the misclassification rate is approximately 30%. 
+
+```{r echo=FALSE, message=FALSE}
+prediction0 <- rep(1, nrow(test_data))
+
+prediction0 <- factor(prediction0, levels = levels(test_data$factor_feedback))
+
+naive_conf_matrix <- table(Predicted = prediction0, Actual = test_data$factor_feedback)
+
+library(ggplot2)
+
+naive_conf_matrix_df <- as.data.frame.matrix(naive_conf_matrix)
+naive_conf_matrix_df <- cbind("Predicted" = rownames(naive_conf_matrix_df), naive_conf_matrix_df)
+naive_conf_matrix_df <- gather(naive_conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(naive_conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#AAF0D1") +
+  labs(title = "Confusion Matrix for Naive Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# misclassification rate
+naive_misclassification_rate <- mean(prediction0 != test_data$factor_feedback)
+print(paste("Naive Misclassification rate:", naive_misclassification_rate))
+```
+
+#### Model 1
+
+Then we build model 1 with logistic regression, using the feedback type as the outcome, and left contrast, right contrast, and average spks as the covariate. Logistic regression analyzes input features, and utilizes maximum likelihood estimation to predict class probabilities. By comparing the performance with the naive model, two models have the same performance.
+
+```{r echo=FALSE, message=FALSE}
+# Train logistic regression model
+fit1 <- glm(factor_feedback ~ left_contrast + right_contrast + avg_spikes, 
+                    data = train_data, 
+                    family = "binomial")
+
+# Print summary of the logistic regression model
+summary(fit1)
+```
+
+```{r echo=FALSE, message=FALSE}
+pred1 <- predict(fit1, test_data %>% select(-factor_feedback), type = 'response')
+
+prediction1 <- factor(ifelse(pred1 > 0.5, '1', '-1'), levels = levels(test_data$factor_feedback))
+
+# Confusion matrix
+conf_matrix <- table(Predicted = prediction1, Actual = test_data$factor_feedback)
+
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#FFDFDD") + 
+  labs(title = "Confusion Matrix for Logistic Regression Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +theme(axis.text.x = element_text(hjust = 1))  
+
+# Misclassification rate
+misclassification_rate <- mean(prediction1 != test_data$factor_feedback)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+Therefore, we employ other methods to build the model, and see if we can improve the performances. Instead of using data frame 1, we use data frame 2. Similarly, 80% of the data frame 2 was randomly selected as the train data 2, and the rest will be the test data 2. 
+
+#### Model 2
+
+We apply the K-nearest neighbors method, which classifies a data point based on the majority class among its k nearest neighbors in the feature space. For KNN approach, we want to choose k that's not too small that is over sensitive to noise or outliers, and not too large that fade the decision boundaries excessively, k = 5 is a common choice to begin. So, we first build model 2 with k = 5. From the confusion matrix, we can see that the misclassification rate is approximately 16.4%. By accuracy, knn approach with k = 5 has better performance compared to the previous models. 
+
+```{r echo=FALSE, message=FALSE}
+set.seed(141)
+# Impute missing values with the mean of the corresponding feature
+impute_mean <- function(x) {
+  mean_value <- mean(x, na.rm = TRUE)
+  x[is.na(x)] <- mean_value
+  return(x)
+}
+
+# Apply the imputation function to the features
+imputed_features <- apply(combined_df, 2, impute_mean)
+
+# Scale the imputed features
+scaled_imputed_features <- scale(imputed_features)
+
+# Split the data into training and testing sets
+
+target=combined_df$feedback
+train_index <- sample(1:nrow(combined_df), 0.8 * nrow(combined_df))
+train_data2 <- imputed_features[train_index, ]
+train_target2 <- target[train_index]
+test_data2 <- imputed_features[-train_index, ]
+test_target2 <- target[-train_index]
+
+# Train the KNN model
+knn_model1 <- knn(train_data2, test_data2, train_target2, 5)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = knn_model1, Actual = test_target2)
+
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#BDEDFF") + 
+  labs(title = "Confusion Matrix for KNN Model(k=5)",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification
+misclassification_rate <- (sum(conf_matrix) - sum(diag(conf_matrix)) )/ sum(conf_matrix)
+print(paste("Misclassification rate:", misclassification_rate))
+
+```
+
+#### Model 3
+
+Afterwards, we also try another model, model 3, with k = 3. From the confusion matrix, the misclassification rate is approximately 16.3%, which is slightly better but similar to model 2.
+
+```{r echo=FALSE, message=FALSE}
+set.seed(141)
+# Train the KNN model
+knn_model2 <- knn(train_data2, test_data2, train_target2, 3)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = knn_model2, Actual = test_target2)
+
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#DCD0FF") + 
+  labs(title = "Confusion Matrix for KNN Model (k=3)",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification
+misclassification_rate <- (sum(conf_matrix) - sum(diag(conf_matrix)) )/ sum(conf_matrix)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+#### Model 4
+
+We built the model 4 with a support vector machine (SVM) algorithm. SVM finds the best line or boundary to separate different groups in the data, maximizing the distance between the closest points of each group. By examining the misclassification rate, which is approximately 1.4%, this model has a high accuracy on predicting.
+
+```{r echo=FALSE, message=FALSE}
+
+library(e1071)
+
+svm_model <- svm(as.factor(train_target2) ~ ., data = train_data2, kernel = "radial")
+
+# Make predictions on test data
+predictions <- predict(svm_model, test_data2)
+
+predictions <- as.factor(predictions)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = predictions, Actual = test_target2)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#F8B88B") + 
+  labs(title = "Confusion Matrix for SVM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification
+misclassification_rate <- mean(predictions != test_target2)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+#### Model 5
+
+We also try to build model 5 with the Gradient Boosting Machine (GBM) algorithm. GBM produces a model by sequentially correcting errors made by the previous one using an ensemble of weak prediction models. In our model, we choose to use n.tree=100, which is a common default and a larger number of trees can help mitigate overfitting. This model ends up predicting the outcomes with 100% accuracy.
+
+```{r echo=FALSE, message=FALSE}
+
+library(gbm)
+
+# Train GBM model
+gbm_model <- gbm(train_target2 ~ ., data = as.data.frame(train_data2), distribution = "bernoulli", n.trees = 100, interaction.depth = 3)
+
+# Predictions on test data
+predictions <- predict(gbm_model, newdata = as.data.frame(test_data2), type = "response")
+
+binary_predictions <- ifelse(predictions > 0.5, 1, -1)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = binary_predictions, Actual = test_target2)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#FFE87C") + 
+  labs(title = "Confusion Matrix for GBM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- mean(binary_predictions != test_target2)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+#### ROC Curve
+
+Then we plot the receiver operating characteristic (ROC) curve for all the models and compare.
+
+```{r echo=FALSE, message=FALSE}
+library(ROCR)
+
+# Model 0 (Bias Guess)
+pred0 = pred1 * 0 + 1
+pr = prediction(pred0, test_data$feedback_type)
+prf0 <- performance(pr, measure = "tpr", x.measure = "fpr")
+
+# Model 1
+pr <- prediction(pred1, test_data$factor_feedback)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+
+# Model 2
+pred_knn <- as.factor(knn_model1)
+pr_knn <- prediction(as.numeric(pred_knn), as.numeric(test_target2))
+prf_knn <- performance(pr_knn, measure = "tpr", x.measure = "fpr")
+
+# Model 3
+pred_knn2 <- as.factor(knn_model2)
+pr_knn2 <- prediction(as.numeric(pred_knn2), as.numeric(test_target2))
+prf_knn2 <- performance(pr_knn2, measure = "tpr", x.measure = "fpr")
+
+#Model 4
+predictions <- predict(svm_model, test_data2)
+predictions <- as.factor(predictions)
+prf_svm <- prediction(as.numeric(predictions), as.numeric(test_target2))
+prf_svm <- performance(prf_svm, measure = "tpr", x.measure = "fpr")
+
+# Model 5 (GBM)
+predictions_gbm <- predict(gbm_model, newdata = as.data.frame(test_data2), type = "response")
+binary_predictions_gbm <- ifelse(predictions_gbm > 0.5, 1, -1)
+pr_gbm <- prediction(binary_predictions_gbm, as.numeric(test_target2))
+prf_gbm <- performance(pr_gbm, measure = "tpr", x.measure = "fpr")
+
+# Add Bias Guess (Model 0) ROC curve
+plot(prf0, col = 'green', main = 'ROC curve')
+
+# Plot Model 1 ROC curve
+plot(prf, add = TRUE, col = 'red')
+
+# Add Model 2 (k-NN 5) ROC curve
+plot(prf_knn, add = TRUE, col = 'blue')
+
+# Add Model 3 (k-NN 3) ROC curve
+plot(prf_knn2, add = TRUE, col = 'purple')
+
+# Add Model 4 (SVM) ROC curve
+plot(prf_svm, add = TRUE, col = 'orange')
+
+# Add Model 5 (GBM) ROC curve
+plot(prf_gbm, add = TRUE, col = 'yellow')
+
+
+# Add legend
+legend("bottomright", legend=c("Bias Guess (Model 0)", "Logistic (Model 1)", "k-NN 5 (Model 2)","k-NN 3 (Model 3)","SVM (Model 4)","GBM (Model 5)"), col=c("green", 'red', 'blue','purple','orange','yellow'), lty=1:1, 
+       cex=0.8)
+```
+
+By looking at the prediction misclassification rate and the ROC curve plot, we can see the logistic regression mode (model 1) is not that effective. GBM (model 5) and SVM (model 4) are better than K nearest neighbor (model 2 and 3). However, we still want to use two different test data: test1.rds, and test2.rds to evaluate the performance of the model.
+
+# Prediction performance on the test sets
+
+From Predictive modeling, we can see that the logistic regression and naive model seems not that effective, compared with KNN, SVM, and GBM models. In addition, for the KNN model, we found the model k=3 and k=5 similar in the previous section. Therefore, we only consider model 3 (k=3) , 4 (SVM) , and 5 (GBM) in the section. We will use two test sets one from session 1 and the other from session 18 to evaluate the performance of the predictive models.
+
+```{r include=FALSE, echo=FALSE, message=FALSE}
+test1<-readRDS("~/Desktop/STA141AProject/test/test1.rds")
+test2<-readRDS("~/Desktop/STA141AProject/test/test2.rds")
+test1_target <- test1$feedback_type
+test2_target <- test2$feedback_type
+```
+
+#### Evalute Performance Using test1.rds data
+
+We noticed that test1.rds comes from Session 1.
+
+```{r echo=FALSE, message=FALSE}
+
+n.trial=length(test1$feedback_type)
+n.area=length(unique(test1$brain_area ))
+
+trial.summaryt1 =matrix(nrow=n.trial,ncol= n.area+1+2+1)
+for(i.t in 1:n.trial){
+  trial.summaryt1[i.t,]=c(average_spike_area(i.t,this_session = test1),
+                          test1$feedback_type[i.t],
+                        test1$contrast_left[i.t],
+                        test1$contrast_right[i.t],
+                        i.t)
+}
+
+colnames(trial.summaryt1)=c(names(average_spike_area(i.t,this_session = test1)), 'feedback', 'left contr.','right contr.','id' )
+
+# Turning it into a data frame
+trial.summaryt1 <- as_tibble(trial.summaryt1)
+kable(head(trial.summaryt1))
+
+```
+
+To test the model with the test data, we need to have the same data dimension as the train data. Therefore we will expand our test data to include every other brain area in other sessions, and the corresponding missing value will be imputed as the mean of the same features.
+
+```{r echo=FALSE, message=FALSE}
+
+brain_areas_test <- setdiff(colnames(combined_df), c("feedback", "left_contr.", "right_contr.", "trial_id", "session_id"))
+
+test1_expanded <- data.frame(matrix(NA, ncol = ncol(combined_df), nrow = nrow(trial.summaryt1)))
+colnames(test1_expanded) <- colnames(combined_df)
+
+# Fill in the available data from the trial_summary_t1 dataframe
+test1_expanded$ACA <-trial.summaryt1$ACA
+test1_expanded$CA3 <-trial.summaryt1$CA3
+test1_expanded$DG <-trial.summaryt1$DG
+test1_expanded$LS <-trial.summaryt1$LS
+test1_expanded$MOs <-trial.summaryt1$MOs
+test1_expanded$root <-trial.summaryt1$root
+test1_expanded$SUB <-trial.summaryt1$SUB
+test1_expanded$VISp <-trial.summaryt1$VISp
+test1_expanded$feedback <- trial.summaryt1$feedback
+test1_expanded$`left contr.` <- trial.summaryt1$`left contr.`
+test1_expanded$`right contr.` <- trial.summaryt1$`right contr.`
+test1_expanded$trial_id <- trial.summaryt1$id
+test1_expanded$session_id <- 1
+
+# Fill in missing columns
+missing_columns <- setdiff(colnames(combined_df), colnames(test1_expanded))
+test1_expanded[, missing_columns] <- NA
+
+# Impute missing values with the mean of the corresponding feature
+for (area in brain_areas_test) {
+  if (area %in% colnames(combined_df)) {
+    test1_expanded[[area]][is.na(test1_expanded[[area]])] <- mean(combined_df[[area]], na.rm = TRUE)
+  } else {
+    test1_expanded[[area]][is.na(test1_expanded[[area]])] <- mean(combined_df[[area]], na.rm = TRUE)
+  }
+}
+
+kable(head(test1_expanded))
+```
+
+```{r include=FALSE}
+# Scale the test data after imputing missing values excepy id 
+scaled_test1_data <- scale(test1_expanded[, !colnames(test1_expanded) %in% c("trial_id", "session_id")])
+
+scaled_test1_data <- cbind(scaled_test1_data, test1_expanded[, c("trial_id", "session_id")])
+
+kable(head(scaled_test1_data))
+```
+
+```{r include=FALSE}
+scaled_test1_data[is.na(scaled_test1_data)] <- 0
+
+test1_target <- test1$feedback_type
+kable(head(scaled_test1_data))
+```
+
+We use a confusion matrix and calculate the misclassification rate to assess the model's effectiveness in predicting feedback types.
+
+```{r echo=FALSE, message=FALSE}
+# Evaluate the model on test1
+knn_model2 <- knn(train_data2, test1_expanded, train_target2, 3)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = knn_model2, Actual = test1_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#DCD0FF") + 
+  labs(title = "Confusion Matrix for KNN Model (k=3)",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- (sum(conf_matrix) - sum(diag(conf_matrix)) )/ sum(conf_matrix)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+```{r echo=FALSE, message=FALSE}
+
+predictions <- predict(svm_model, test1_expanded)
+
+predictions <- as.factor(predictions)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = predictions, Actual = test1_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#F8B88B") + 
+  labs(title = "Confusion Matrix for SVM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- mean(predictions != test1_target)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+```{r echo=FALSE, message=FALSE}
+
+predictions <- predict(gbm_model, newdata = as.data.frame(test1_expanded), type = "response")
+
+binary_predictions <- ifelse(predictions > 0.5, 1, -1)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = binary_predictions, Actual = test1_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#FFE87C") + 
+  labs(title = "Confusion Matrix for GBM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- mean(binary_predictions != test1_target)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+From the confusion matrix, we know that the misclassification rate for each model is:
+
+-   Model 3 (k=3): 13%
+
+-   Model 4 (SVM): 1%
+
+-   Model 5 (GBM): 0%
+
+While all 3 models show relatively good performance on test1, by evaluating the models with how accurate it is on predicting the feedback type, we might want to choose the GBM model as our predictive model.
+
+We now want to test the model again with another test data: test2.rds, with similar process as we have done for test1.rds
+
+#### Evalute Performance Using test2.rds data
+
+We noticed that test2.rds comes from Session 18.
+
+```{r echo=FALSE, message=FALSE}
+
+n.trial=length(test2$feedback_type)
+n.area=length(unique(test2$brain_area))
+
+trial.summaryt2 =matrix(nrow=n.trial,ncol= n.area+1+2+1)
+for(i.t in 1:n.trial){
+  trial.summaryt2[i.t,]=c(average_spike_area(i.t,this_session = test2),
+                          test2$feedback_type[i.t],
+                        test2$contrast_left[i.t],
+                        test2$contrast_right[i.t],
+                        i.t)
+}
+
+colnames(trial.summaryt2)=c(names(average_spike_area(i.t,this_session = test2)), 'feedback', 'left contr.','right contr.','id' )
+
+trial.summaryt2 <- as_tibble(trial.summaryt2)
+kable(head(trial.summaryt2))
+
+```
+
+To test the model with the test data, we need to have the same data dimension as the train data. Therefore we will expand our test data to include every other brain area in other sessions, and the corresponding missing value will be imputed as the mean of the same features.
+
+```{r echo=FALSE, message=FALSE}
+
+brain_areas_test <- setdiff(colnames(combined_df), c("feedback", "left_contr.", "right_contr.", "trial_id", "session_id"))
+
+test2_expanded <- data.frame(matrix(NA, ncol = ncol(combined_df), nrow = nrow(trial.summaryt2)))
+colnames(test2_expanded) <- colnames(combined_df)
+
+# Fill in the available data from the trial_summary_t2 dataframe
+test2_expanded$ACB <-trial.summaryt2$ACB
+test2_expanded$CA3 <-trial.summaryt2$CA3
+test2_expanded$CP <-trial.summaryt2$CP
+test2_expanded$LGd <-trial.summaryt2$LGd
+test2_expanded$OT <-trial.summaryt2$OT
+test2_expanded$root <-trial.summaryt2$root
+test2_expanded$SI <-trial.summaryt2$SI
+test2_expanded$SNr <-trial.summaryt2$SNr
+test2_expanded$TH <-trial.summaryt2$TH
+test2_expanded$ZI <-trial.summaryt2$ZI
+test2_expanded$feedback <- trial.summaryt2$feedback
+test2_expanded$`left contr.` <- trial.summaryt2$`left contr.`
+test2_expanded$`right contr.` <- trial.summaryt2$`right contr.`
+test2_expanded$trial_id <- trial.summaryt2$id
+test2_expanded$session_id <- 18
+
+# Fill in missing columns that are not present in the test data
+missing_columns <- setdiff(colnames(combined_df), colnames(test2_expanded))
+test2_expanded[, missing_columns] <- NA
+
+# Impute missing values with the mean of the corresponding feature
+for (area in brain_areas_test) {
+  if (area %in% colnames(combined_df)) {
+    test2_expanded[[area]][is.na(test2_expanded[[area]])] <- mean(combined_df[[area]], na.rm = TRUE)
+  } else {
+    test2_expanded[[area]][is.na(test2_expanded[[area]])] <- mean(combined_df[[area]], na.rm = TRUE)
+  }
+}
+kable(head(test2_expanded))
+```
+
+```{r include=FALSE}
+
+# Scale the test data after imputing missing values excepy id 
+scaled_test2_data <- scale(test2_expanded[, !colnames(test2_expanded) %in% c("trial_id", "session_id")])
+
+scaled_test2_data <- cbind(scaled_test2_data, test2_expanded[, c("trial_id", "session_id")])
+
+kable(head(scaled_test2_data))
+```
+
+We use a confusion matrix and calculate the misclassification rate to assess the model's effectiveness in predicting feedback types.
+
+```{r echo=FALSE, message=FALSE}
+# Evaluate the model on test data 1
+knn_model2 <- knn(train_data2, test2_expanded, train_target2, 3)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = knn_model2, Actual = test2_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#DCD0FF") + 
+  labs(title = "Confusion Matrix for KNN Model (k=3)",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- (sum(conf_matrix) - sum(diag(conf_matrix)) )/ sum(conf_matrix)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+```{r echo=FALSE, message=FALSE}
+
+predictions <- predict(svm_model, test2_expanded)
+predictions <- as.factor(predictions)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = predictions, Actual = test2_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#F8B88B") + 
+  labs(title = "Confusion Matrix for SVM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- mean(predictions != test2_target)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+```{r echo=FALSE, message=FALSE}
+
+predictions <- predict(gbm_model, newdata = as.data.frame(test2_expanded), type = "response")
+binary_predictions <- ifelse(predictions > 0.5, 1, -1)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = binary_predictions, Actual = test2_target)
+conf_matrix_df <- as.data.frame.matrix(conf_matrix)
+conf_matrix_df <- cbind("Predicted" = rownames(conf_matrix_df), conf_matrix_df)
+conf_matrix_df <- gather(conf_matrix_df, key = "Actual", value = "Frequency", -Predicted)
+
+ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#FFE87C") + 
+  labs(title = "Confusion Matrix for GBM Model",
+       x = "Actual", y = "Predicted") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+# Misclassification rate
+misclassification_rate <- mean(binary_predictions != test2_target)
+print(paste("Misclassification rate:", misclassification_rate))
+```
+
+From the confusion matrix, we know that the misclassification rate for each model is:
+
+-   Model 3 (k=3): 20%
+
+-   Model 4 (SVM): 2%
+
+-   Model 5 (GBM): 0%
+
+While all 3 models also show relatively good performance on test2, by evaluating the models with how accurate it is on predicting the feedback type, we might want to choose the GBM model as our predictive model.
+
+#### Comparing the results
+
+In general, from test1 and test2, we can see that the prediction on test1 shows more accuracy for all the models. By testing 3 models using different test data, we have similar results that SVM might be better than KNN, and GBM might be better than SVM. This suggests choosing GBM based on the accuracy of predicting the outcome. 
+
+# Discussion
+
+Based on the analysis conducted, we have explored the data across each session and trial, created two data frames involving benchmark methods, imputing missing values, and scaling, then built predictive models with 5 methods. 
+
+These models include naive model, logistic regression, k-nearest neighbors (KNN), support vector machines (SVM), and gradient boosting machines (GBM) model.
+
+We used different test sets and considered several metrics including the misclassification rate, ROC curve, and used the confusion matrix to calculate the misclassification rate to evaluate the performance of each model. 
+
+In conclusion, based on the analysis conducted, the chosen model for the predictive task would be the one that demonstrates the best overall performance across multiple metrics, which we decide to use the GBM model (model 5).
+
+During the analysis process, the main challenges we faced was to preprocess the raw data, which required careful consideration and may have introduced some degree of bias or error. This analysis primarily summarizes the information in the provided data into average spike counts and average spikes per brain area, thus did not explore much on how time could affect the outcomes. Exploring the temporal aspect of the data could be a potential area of improvement for future research, as it may provide additional insights into the underlying patterns and relationships within the data. In addition, we decided not to scale our train data, due to the missing value that we can\'t resolve in the process of scaling the train data from a single session. However, scaling data might be beneficial in the model training process for future improvement.
+
+As for further research, it might also be helpful to collaborate with domain experts and incorporate domain knowledge into the modeling process, as it might improve the relevance and applicability of predictive models.
+
+# Reference {.unnumbered}
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266--273 (2019). <https://doi.org/10.1038/s41586-019-1787-x>
